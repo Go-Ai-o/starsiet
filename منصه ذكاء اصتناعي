@@ -1,0 +1,329 @@
+"""
+نظام الشركة الافتراضية المتكامل
+يتضمن: واجهة ويب، 15 موظف آلي، إدارة مهام، تقارير، إرسال بريد إلكتروني
+"""
+
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import smtplib
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask_socketio import SocketIO
+from werkzeug.security import generate_password_hash, check_password_hash
+from fpdf import FPDF
+
+# تهيئة التطبيق
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key')
+socketio = SocketIO(app)
+
+# ------------------------- قاعدة البيانات -------------------------
+def init_db():
+    """تهيئة قاعدة البيانات"""
+    conn = sqlite3.connect('company.db')
+    c = conn.cursor()
+    
+    # جدول الموظفين
+    c.execute('''CREATE TABLE IF NOT EXISTS employees
+                (id INTEGER PRIMARY KEY,
+                name TEXT,
+                dept TEXT,
+                skills TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # جدول المهام
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks
+                (id INTEGER PRIMARY KEY,
+                dept TEXT,
+                task TEXT,
+                assigned_to INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP)''')
+    
+    # إضافة بيانات أولية
+    if not c.execute('SELECT 1 FROM employees LIMIT 1').fetchone():
+        employees = [
+            ('بوت التسويق 1', 'marketing', 'إعلانات,تحليل السوق', 'active'),
+            ('بوت التسويق 2', 'marketing', 'إعلانات,وسائل التواصل', 'active'),
+            ('بوت التطوير 1', 'development', 'بايثون,فلاسك', 'active'),
+            ('بوت التطوير 2', 'development', 'جافاسكريبت,HTML', 'active'),
+            ('بوت الماليات 1', 'finance', 'تحليل مالي,المحاسبة', 'active'),
+            ('بوت الموارد البشرية 1', 'hr', 'التوظيف,التدريب', 'active'),
+            ('بوت العمليات 1', 'operations', 'إدارة العمليات,اللوجستيات', 'active')
+        ]
+        c.executemany('INSERT INTO employees (name, dept, skills, status) VALUES (?, ?, ?, ?)', employees)
+    
+    conn.commit()
+    conn.close()
+
+def get_db():
+    """الحصول على اتصال بقاعدة البيانات"""
+    conn = sqlite3.connect('company.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ------------------------- نظام المصادقة -------------------------
+users = {
+    "admin": {
+        "password": generate_password_hash(os.getenv('ADMIN_PASS', 'admin123')),
+        "role": "admin"
+    },
+    "manager": {
+        "password": generate_password_hash(os.getenv('MANAGER_PASS', 'mgr456')),
+        "role": "manager"
+    }
+}
+
+def auth_required(f):
+    """ديكوراتور للتحقق من المصادقة"""
+    def wrapper(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return wrapper
+
+# ------------------------- نظام البوتات -------------------------
+class Bot:
+    """كلاس أساسي للبوتات"""
+    def __init__(self, bot_id, dept, skills):
+        self.id = bot_id
+        self.name = f"بوت {dept} {bot_id}"
+        self.dept = dept
+        self.skills = skills.split(',')
+        self.current_task = None
+        self.task_history = []
+
+    def assign_task(self, task):
+        """تعيين مهمة للبوت"""
+        self.current_task = task
+        self.task_history.append({
+            'task': task,
+            'start': datetime.now(),
+            'status': 'working'
+        })
+        return f"تم تعيين المهمة: {task}"
+
+    def complete_task(self):
+        """إكمال المهمة الحالية"""
+        if self.current_task:
+            for task in self.task_history:
+                if task['task'] == self.current_task:
+                    task['end'] = datetime.now()
+                    task['status'] = 'completed'
+            result = f"تم إكمال المهمة: {self.current_task}"
+            self.current_task = None
+            return result
+        return "لا توجد مهمة حالية"
+
+class Department:
+    """كلاس لإدارة قسم كامل"""
+    def __init__(self, name, bot_count=3):
+        self.name = name
+        self.bots = [Bot(i+1, name, "مهارة افتراضية") for i in range(bot_count)]
+        self.tasks = []
+    
+    def add_task(self, task):
+        """إضافة مهمة للقسم"""
+        for bot in self.bots:
+            if not bot.current_task:
+                bot.assign_task(task)
+                self.tasks.append(task)
+                return f"تم تعيين المهمة لـ {bot.name}"
+        return "جميع البوتات مشغولة"
+
+# ------------------------- إدارة الشركة -------------------------
+class VirtualCompany:
+    """كلاس لإدارة الشركة الافتراضية"""
+    def __init__(self):
+        self.departments = {
+            'marketing': Department('التسويق'),
+            'development': Department('التطوير'),
+            'finance': Department('الماليات'),
+            'hr': Department('الموارد البشرية'),
+            'operations': Department('العمليات')
+        }
+        self.ceo = CEORole()
+    
+    def get_status(self):
+        """الحصول على حالة الشركة"""
+        return {
+            dept: {
+                'available_bots': sum(1 for bot in dep.bots if not bot.current_task),
+                'busy_bots': sum(1 for bot in dep.bots if bot.current_task),
+                'pending_tasks': len(dep.tasks)
+            }
+            for dept, dep in self.departments.items()
+        }
+
+class CEORole:
+    """دور المدير التنفيذي"""
+    def __init__(self):
+        self.name = "المدير التنفيذي"
+        self.role = "إدارة الشركة"
+    
+    def make_decision(self, decision):
+        """اتخاذ قرار إداري"""
+        return f"تم اتخاذ القرار: {decision}"
+
+# ------------------------- واجهة الويب -------------------------
+@app.route('/')
+@auth_required
+def index():
+    """الصفحة الرئيسية"""
+    return render_template('index.html', departments=company.departments.keys())
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """صفحة تسجيل الدخول"""
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if username in users and check_password_hash(users[username]['password'], password):
+            session['username'] = username
+            return redirect(url_for('index'))
+        return render_template('login.html', error="بيانات الدخول غير صحيحة")
+    return render_template('login.html')
+
+@app.route('/department/<dept_name>')
+@auth_required
+def department(dept_name):
+    """صفحة القسم"""
+    if dept_name not in company.departments:
+        return "القسم غير موجود", 404
+    
+    dept = company.departments[dept_name]
+    return render_template('department.html', 
+                         department=dept,
+                         bots=dept.bots,
+                         tasks=dept.tasks)
+
+# ------------------------- واجهة API -------------------------
+@app.route('/api/status')
+def api_status():
+    """حالة النظام"""
+    return jsonify({
+        'status': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'departments': company.get_status()
+    })
+
+@app.route('/api/assign_task', methods=['POST'])
+@auth_required
+def assign_task():
+    """تعيين مهمة جديدة"""
+    data = request.json
+    dept = data.get('department')
+    task = data.get('task')
+    
+    if dept not in company.departments:
+        return jsonify({'error': 'القسم غير موجود'}), 404
+    
+    result = company.departments[dept].add_task(task)
+    return jsonify({'result': result})
+
+# ------------------------- التشغيل -------------------------
+def background_work():
+    """مهام خلفية للبوتات"""
+    while True:
+        for dept in company.departments.values():
+            for bot in dept.bots:
+                if bot.current_task:
+                    time.sleep(5)  # محاكاة وقت العمل
+                    bot.complete_task()
+        time.sleep(10)
+
+if __name__ == '__main__':
+    # تهيئة النظام
+    init_db()
+    company = VirtualCompany()
+    
+    # بدء المهام الخلفية
+    threading.Thread(target=background_work, daemon=True).start()
+    
+    # تشغيل التطبيق
+    socketio.run(app, host='0.0.0.0', port=5000)د templates وأضف هذه
+templates/base.html
+<!DOCTYPE html>
+<html dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>{% block title %}الشركة الافتراضية{% endblock %}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        .navbar { background: #333; color: white; padding: 10px; }
+        .card { border: 1px solid #ddd; padding: 15px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h1>الشركة الافتراضية</h1>
+    </div>
+    {% block content %}{% endblock %}
+</body>
+</html>
+‏templates/login.html‏
+{% extends "base.html" %}
+
+{% block content %}
+<h2>تسجيل الدخول</h2>
+{% if error %}
+<p style="color: red">{{ error }}</p>
+{% endif %}
+<form method="POST">
+    <input type="text" name="username" placeholder="اسم المستخدم">
+    <input type="password" name="password" placeholder="كلمة المرور">
+    <button type="submit">دخول</button>
+</form>
+{% endblock %}
+‏github/workflows/run.yml‏
+name: Run Virtual Company
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  run-company:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flask flask-socketio werkzeug fpdf2
+        
+    - name: Run application
+      env:
+        SECRET_KEY: ${{ secrets.SECRET_KEY }}
+        ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+        MANAGER_PASS: ${{ secrets.MANAGER_PASS }}
+      run: |
+        python app.py
+‏requirements.txt‏
+flask==2.0.1
+flask-socketio==5.1.1
+werkzeug==2.0.1
+fpdf2==2.5.6
+python-dotenv==0.19.0
+   - الواجهة الرئيسية: `/`
+   - صفحة تسجيل الدخول: `/login`
+   - واجهة API: `/api/status`
+GitHub Actions
+
+
+
